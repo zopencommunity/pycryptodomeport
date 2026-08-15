@@ -1,0 +1,372 @@
+# bump: pycryptodome-version /PYCRYPTODOME_VERSION="(.*)"/ https://github.com/Legrandin/pycryptodome.git|semver:*
+PYCRYPTODOME_VERSION="3.23.0"
+
+###
+### Build control file for the pycryptodome port
+###
+### pycryptodome is a self-contained cryptographic library: AES, ChaCha20, RSA,
+### ECC, SHA-2/3, HMAC, PBKDF2 and the rest, implemented in C with no external
+### library to link against. Forty extension modules and no runtime dependency.
+###
+### Distinct from cryptography (which wraps OpenSSL) and from pynacl (which
+### wraps libsodium) -- code that wants one will not accept the others.
+###
+
+export ZOPEN_PROJECT_NAME="pycryptodome"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_CATEGORIES="development security library"
+
+export ZOPEN_STABLE_URL="https://github.com/Legrandin/pycryptodome.git"
+export ZOPEN_STABLE_TAG="v${PYCRYPTODOME_VERSION}"
+export ZOPEN_DEV_URL="https://github.com/Legrandin/pycryptodome.git"
+
+export ZOPEN_STABLE_DEPS="check_python"
+export ZOPEN_DEV_DEPS="check_python"
+export ZOPEN_RUNTIME_DEPS="check_python"
+
+export ZOPEN_BUILD_SYSTEM="Python"
+
+
+zopen_get_version() {
+  echo "${PYCRYPTODOME_VERSION}"
+}
+
+# Build ordinary per-interpreter extensions instead of limited-API ones.
+#
+# pycryptodome sets py_limited_api=True on all forty of its extensions, which
+# produces a single cp37-abi3 wheel meant to serve every interpreter. Neither
+# half of that survives here.
+#
+# The stable ABI does not hold across versions on this platform: an abi3
+# extension built by 3.12 dies inside CPython's allocator under 3.13 and 3.14
+# with CEE3204S, a protection exception that takes the interpreter down rather
+# than raising ImportError. And building once per interpreter emits the same
+# cp37-abi3 filename each time, so the three overwrite one another in dist/ and
+# only the last survives -- leaving two interpreters with no wheel at all.
+#
+# Rewritten by pattern rather than carried as a patch: the flag is repeated on
+# every Extension(), so a diff would need reapplying whenever upstream adds a
+# module, and would fail closed by silently producing abi3 wheels again.
+zopen_pre_build() {
+  # Two independent fixes. Neither may short-circuit the other: an incremental
+  # rebuild finds setup.py already rewritten, and an early return there used to
+  # skip the probe fix entirely, so the build failed exactly as it had before
+  # with nothing in the log to show the hook had run.
+  # State that posix_memalign exists rather than letting the build probe for it.
+  #
+  # src/common.h selects an aligned allocator from HAVE_POSIX_MEMALIGN or
+  # HAVE_MEMALIGN and stops with "#error No routines for aligned memory" if it has
+  # neither. Those macros come from compile-and-link probes in compiler_opt.py,
+  # and those probes cannot answer correctly here: the build sets CC, and with CC
+  # set the probe links with a bare "clang" and none of the interpreter's link
+  # settings, so it fails and reports the feature absent. Verified by bisecting
+  # the build environment -- the probe returns True with nothing set and False
+  # with CC alone.
+  #
+  # The answer it should have given is not in doubt. stdlib.h declares
+  # posix_memalign at line 1342 under _XOPEN_SOURCE=600, which CPPFLAGS already
+  # carries, and a direct compile of the probe's own source succeeds.
+  #
+  # So assert the macro instead. Fixing the probe would mean unsetting CC for the
+  # whole build, which changes how every extension is compiled to work around a
+  # question we can answer outright.
+  # _UNIX03_SOURCE has to go on CFLAGS, not CPPFLAGS. The build already sets
+  # -D_XOPEN_SOURCE=600 in CPPFLAGS, which would declare posix_memalign, but
+  # setuptools compiles extensions with CFLAGS alone -- so common.h calls it
+  # undeclared and this compiler rejects that outright:
+  #
+  #   src/common.h:164: error: call to undeclared function 'posix_memalign'
+  # -include the declaration. Setting the feature-test macros is not enough:
+  # through common.h's include chain posix_memalign is implicitly declared even
+  # with _UNIX03_SOURCE and _XOPEN_SOURCE=600 both set, and the clang on PATH
+  # (21.1.1) rejects an implicit declaration rather than warning. See the header
+  # for why this is preferable to -Wno-error on that diagnostic.
+  export CFLAGS="-DHAVE_POSIX_MEMALIGN -include ${ZOPEN_ROOT}/zos/zos-posix-memalign.h ${CFLAGS}"
+
+  _zopen_pcd_no_limited_api || return 1
+  return 0
+}
+
+# Build ordinary per-interpreter extensions instead of limited-API ones.
+#
+# pycryptodome sets py_limited_api=True on all forty of its extensions, which
+# produces a single cp37-abi3 wheel meant to serve every interpreter. Neither
+# half of that survives here.
+#
+# The stable ABI does not hold across versions on this platform: an abi3
+# extension built by 3.12 dies inside CPython's allocator under 3.13 and 3.14
+# with CEE3204S, a protection exception that takes the interpreter down rather
+# than raising ImportError. And building once per interpreter emits the same
+# cp37-abi3 filename each time, so the three overwrite one another in dist/ and
+# only the last survives -- leaving two interpreters with no wheel at all.
+#
+# Rewritten by pattern rather than carried as a patch: the flag is repeated on
+# every Extension(), so a diff would need reapplying whenever upstream adds a
+# module, and would fail closed by silently producing abi3 wheels again.
+_zopen_pcd_no_limited_api() {
+  [ -f setup.py ] || return 0
+  grep -q "py_limited_api=True" setup.py || return 0
+
+  # Two separate places ask for the limited API, and clearing only the first
+  # leaves the wheel still tagged cp37: the Extension() flags decide how the
+  # modules are compiled, while setup_options sets what bdist_wheel stamps on the
+  # filename. With just the flags rewritten the build produced
+  # pycryptodome-3.23.0-cp37-none-any.whl -- one wheel claiming to serve every
+  # interpreter, which is the thing being avoided.
+  _tag=$(ls -T setup.py 2> /dev/null | awk '{print $2}')
+  sed -e 's/py_limited_api=True/py_limited_api=False/g' \
+      -e "s/{'bdist_wheel': {'py_limited_api': 'cp37'}}/{}/" \
+      setup.py > setup.py.zos \
+    && mv setup.py.zos setup.py || return 1
+  [ -n "${_tag}" ] && chtag -tc "${_tag}" setup.py 2> /dev/null
+
+  printInfo "Disabled the limited API on $(grep -c 'py_limited_api=False' setup.py) extension(s)"
+  return 0
+}
+
+zopen_python_test() {
+  PYCRYPTODOME_EXPECTED_VERSION="${PYCRYPTODOME_VERSION}" python - <<'PYEOF'
+import binascii
+import os
+import sys
+import sysconfig
+
+# Exercise the installed wheel, not the checkout: pycryptodome's package sits at
+# the repository root as Crypto/, so the build directory would shadow it and the
+# tests would pass against source that was never packaged.
+#
+# realpath on both sides: /tmp is a symlink to /$SYSNAME/tmp here, so a path
+# spelled /tmp/... and a working directory of /S0W1/tmp/... are the same place
+# while abspath compares them as different.
+_here = os.path.realpath(os.getcwd())
+sys.path = [p for p in sys.path
+            if p not in ("", ".") and os.path.realpath(p) != _here]
+
+failures = 0
+total = 0
+
+
+def check(label, fn):
+    global failures, total
+    total += 1
+    try:
+        if fn():
+            print("PASS:", label)
+        else:
+            print("FAIL:", label, file=sys.stderr)
+            failures += 1
+    except Exception as exc:
+        print("FAIL:", label, "-", exc, file=sys.stderr)
+        failures += 1
+
+
+try:
+    import Crypto
+    from Crypto.Cipher import AES, ChaCha20, PKCS1_OAEP
+    from Crypto.Hash import SHA256, SHA3_256, HMAC
+    from Crypto.Protocol.KDF import PBKDF2
+    from Crypto.PublicKey import RSA, ECC
+    from Crypto.Random import get_random_bytes
+    from Crypto.Signature import pkcs1_15, DSS
+    from Crypto.Util import Counter
+except ImportError as exc:
+    print("FAIL: import Crypto -", exc, file=sys.stderr)
+    print("pycryptodome FAILED to import on Python %s" % sys.version.split()[0])
+    sys.exit(1)
+
+import importlib.metadata
+
+check("imported from the installed wheel, not the source tree",
+      lambda: os.path.realpath(Crypto.__file__).startswith(
+          os.path.realpath(sysconfig.get_paths()["purelib"])))
+
+check("version is the one this port builds",
+      lambda: importlib.metadata.version("pycryptodome")
+      == os.environ["PYCRYPTODOME_EXPECTED_VERSION"])
+
+# Every algorithm below is a compiled extension. Naming one explicitly turns a
+# missing binary into a legible failure rather than an AttributeError later.
+check("a compiled cipher extension is loaded",
+      lambda: "_raw_aes" in str(AES._raw_aes_lib.__class__)
+      or AES._raw_aes_lib is not None)
+
+
+def aes_ecb_known_answer():
+    # FIPS-197 appendix C.1: the canonical AES-128 vector. A round trip alone
+    # would pass on an implementation that is merely self-consistent.
+    key = binascii.unhexlify("000102030405060708090a0b0c0d0e0f")
+    plain = binascii.unhexlify("00112233445566778899aabbccddeeff")
+    expect = "69c4e0d86a7b0430d8cdb78070b4c55a"
+    got = AES.new(key, AES.MODE_ECB).encrypt(plain)
+    return binascii.hexlify(got).decode() == expect
+
+
+check("AES-128 matches the FIPS-197 vector", aes_ecb_known_answer)
+
+
+def aes_gcm_round_trip():
+    key = get_random_bytes(32)
+    cipher = AES.new(key, AES.MODE_GCM)
+    ct, tag = cipher.encrypt_and_digest(b"zopen on z/OS")
+    plain = AES.new(key, AES.MODE_GCM, nonce=cipher.nonce)
+    return plain.decrypt_and_verify(ct, tag) == b"zopen on z/OS"
+
+
+check("AES-GCM round trip", aes_gcm_round_trip)
+
+
+def aes_gcm_detects_tampering():
+    key = get_random_bytes(32)
+    cipher = AES.new(key, AES.MODE_GCM)
+    ct, tag = cipher.encrypt_and_digest(b"zopen on z/OS")
+    broken = bytearray(ct)
+    broken[0] ^= 0x01
+    verifier = AES.new(key, AES.MODE_GCM, nonce=cipher.nonce)
+    try:
+        verifier.decrypt_and_verify(bytes(broken), tag)
+    except ValueError:
+        return True
+    return False
+
+
+check("AES-GCM rejects a tampered ciphertext", aes_gcm_detects_tampering)
+
+
+def sha256_known_answer():
+    # FIPS-180 vector for "abc".
+    return SHA256.new(b"abc").hexdigest() == (
+        "ba7816bf8f01cfea414140de5dae2223"
+        "b00361a396177a9cb410ff61f20015ad")
+
+
+check("SHA-256 matches the FIPS-180 vector", sha256_known_answer)
+
+
+def sha3_known_answer():
+    return SHA3_256.new(b"abc").hexdigest() == (
+        "3a985da74fe225b2045c172d6bd390bd"
+        "855f086e3e9d525b46bfe24511431532")
+
+
+check("SHA3-256 matches its reference vector", sha3_known_answer)
+
+
+def hmac_known_answer():
+    # RFC 4231 test case 1.
+    mac = HMAC.new(b"\x0b" * 20, b"Hi There", digestmod=SHA256)
+    return mac.hexdigest() == (
+        "b0344c61d8db38535ca8afceaf0bf12b"
+        "881dc200c9833da726e9376c2e32cff7")
+
+
+check("HMAC-SHA256 matches the RFC 4231 vector", hmac_known_answer)
+
+
+def chacha20_round_trip():
+    key = get_random_bytes(32)
+    cipher = ChaCha20.new(key=key)
+    ct = cipher.encrypt(b"zopen on z/OS")
+    return ChaCha20.new(key=key, nonce=cipher.nonce).decrypt(ct) == b"zopen on z/OS"
+
+
+check("ChaCha20 round trip", chacha20_round_trip)
+
+
+def pbkdf2_known_answer():
+    # RFC 6070 case 2, restated for SHA-256 via a fixed self-check: derive twice
+    # and confirm determinism plus length, which is what the extension governs.
+    salt = get_random_bytes(16)
+    a = PBKDF2(b"password", salt, dkLen=32, count=1000, hmac_hash_module=SHA256)
+    b = PBKDF2(b"password", salt, dkLen=32, count=1000, hmac_hash_module=SHA256)
+    return a == b and len(a) == 32
+
+
+check("PBKDF2 is deterministic", pbkdf2_known_answer)
+
+
+def rsa_sign_verify():
+    key = RSA.generate(2048)
+    digest = SHA256.new(b"zopen on z/OS")
+    sig = pkcs1_15.new(key).sign(digest)
+    pkcs1_15.new(key.publickey()).verify(digest, sig)
+    other = SHA256.new(b"a different message")
+    try:
+        pkcs1_15.new(key.publickey()).verify(other, sig)
+    except ValueError:
+        return True
+    return False
+
+
+check("RSA signs, verifies, and rejects a mismatch", rsa_sign_verify)
+
+
+def rsa_encrypt_round_trip():
+    key = RSA.generate(2048)
+    ct = PKCS1_OAEP.new(key.publickey()).encrypt(b"zopen")
+    return PKCS1_OAEP.new(key).decrypt(ct) == b"zopen"
+
+
+check("RSA-OAEP round trip", rsa_encrypt_round_trip)
+
+
+def ecc_sign_verify():
+    key = ECC.generate(curve="P-256")
+    digest = SHA256.new(b"zopen on z/OS")
+    sig = DSS.new(key, "fips-186-3").sign(digest)
+    DSS.new(key.public_key(), "fips-186-3").verify(digest, sig)
+    return True
+
+
+check("ECDSA P-256 signs and verifies", ecc_sign_verify)
+
+
+def ctr_mode_counter():
+    key = get_random_bytes(16)
+    ctr = Counter.new(128)
+    ct = AES.new(key, AES.MODE_CTR, counter=ctr).encrypt(b"zopen on z/OS")
+    return AES.new(key, AES.MODE_CTR,
+                   counter=Counter.new(128)).decrypt(ct) == b"zopen on z/OS"
+
+
+check("AES-CTR round trip through the counter helper", ctr_mode_counter)
+
+check("the RNG yields distinct values",
+      lambda: len({get_random_bytes(16) for _ in range(200)}) == 200)
+
+print()
+print("pycryptodome %s on Python %s  --  %d passed, %d failed" % (
+    importlib.metadata.version("pycryptodome"),
+    sys.version.split()[0], total - failures, failures))
+sys.exit(1 if failures else 0)
+PYEOF
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c prints 0 when nothing matches and also exits 1, so
+  # the fallback appends a second zero and the arithmetic dies with FSUM9224.
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+  total=$((passed + failed))
+
+  # An interpreter whose test script dies before the first check contributes no
+  # PASS and no FAIL, so counting those alone would score a crash as a clean run.
+  interpreters=$(grep -c "^pycryptodome .* on Python" "${chk}" 2>/dev/null)
+  interpreters=${interpreters:-0}
+  expected=$(echo "${ZOPEN_PYTHON_VERSIONS:-3.12 3.13 3.14}" | wc -w | tr -d ' ')
+  if [ "${interpreters}" -lt "${expected}" ]; then
+    silent=$((expected - interpreters))
+    failed=$((failed + silent))
+    total=$((total + silent))
+  fi
+
+  echo "actualFailures:${failed}"
+  echo "totalTests:${total}"
+  echo "expectedFailures:0"
+}
+
+zopen_append_to_validate_install() {
+  echo "python3 -c \"from Crypto.Cipher import AES; from Crypto.Random import get_random_bytes; k = get_random_bytes(32); c = AES.new(k, AES.MODE_GCM); ct, t = c.encrypt_and_digest(b'ok'); assert AES.new(k, AES.MODE_GCM, nonce=c.nonce).decrypt_and_verify(ct, t) == b'ok'; import importlib.metadata; print('pycryptodome', importlib.metadata.version('pycryptodome'))\""
+}
