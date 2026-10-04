@@ -1,5 +1,5 @@
 # bump: pycryptodome-version /PYCRYPTODOME_VERSION="(.*)"/ https://github.com/Legrandin/pycryptodome.git|semver:*
-PYCRYPTODOME_VERSION="3.23.0"
+PYCRYPTODOME_VERSION="3.24.0"
 
 ###
 ### Build control file for the pycryptodome port
